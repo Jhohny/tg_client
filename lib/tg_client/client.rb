@@ -81,6 +81,134 @@ module TgClient
       recv_plain
     end
 
+    # Run the three-step MTProto 2.0 DH handshake against the currently
+    # connected transport. Populates @auth_key, @auth_key_id, @server_salt.
+    # See https://core.telegram.org/mtproto/auth_key.
+    def do_dh_handshake
+      nonce = SecureRandom.bytes(16)
+
+      res_pq = invoke_plain("req_pq_multi", nonce: nonce)
+      raise AuthError, "nonce mismatch in resPQ" unless res_pq[:nonce] == nonce
+      server_nonce = res_pq[:server_nonce]
+      pq_bytes     = res_pq[:pq]
+      fingerprints = res_pq[:server_public_key_fingerprints]
+
+      p_bytes, q_bytes = Crypto.factor_pq(pq_bytes)
+      selected = Crypto.select_public_key(fingerprints)
+      raise AuthError, "no matching RSA public key for #{fingerprints.inspect}" unless selected
+      fp, rsa_key = selected
+
+      new_nonce = SecureRandom.bytes(32)
+
+      pq_inner_bytes = @serializer.serialize_object(
+        _:            "p_q_inner_data_dc",
+        pq:           pq_bytes,
+        p:            p_bytes,
+        q:            q_bytes,
+        nonce:        nonce,
+        server_nonce: server_nonce,
+        new_nonce:    new_nonce,
+        dc:           @dc_id
+      )
+      encrypted_pq = Crypto.rsa_pad_encrypt(rsa_key, pq_inner_bytes)
+
+      server_dh = invoke_plain(
+        "req_DH_params",
+        nonce:                  nonce,
+        server_nonce:           server_nonce,
+        p:                      p_bytes,
+        q:                      q_bytes,
+        public_key_fingerprint: fp,
+        encrypted_data:         encrypted_pq
+      )
+      raise AuthError, "unexpected DH response: #{server_dh[:_]}" unless server_dh[:_] == "server_DH_params_ok"
+      raise AuthError, "nonce mismatch in server_DH_params_ok" unless server_dh[:nonce] == nonce
+      raise AuthError, "server_nonce mismatch in server_DH_params_ok" unless server_dh[:server_nonce] == server_nonce
+
+      tmp_key, tmp_iv = dh_kdf(new_nonce, server_nonce)
+      decrypted = Crypto.aes_ige_decrypt(tmp_key, tmp_iv, server_dh[:encrypted_answer])
+
+      inner_hash    = decrypted[0, 20]
+      inner_payload = decrypted.byteslice(20..)
+      server_dh_inner = @deserializer.deserialize(inner_payload)
+      raise AuthError, "expected server_DH_inner_data, got #{server_dh_inner[:_]}" unless server_dh_inner[:_] == "server_DH_inner_data"
+
+      reserialized = @serializer.serialize_object(server_dh_inner)
+      raise AuthError, "server_DH_inner_data hash mismatch" unless Crypto.sha1(reserialized) == inner_hash
+      raise AuthError, "nonce mismatch in server_DH_inner_data" unless server_dh_inner[:nonce] == nonce
+      raise AuthError, "server_nonce mismatch in server_DH_inner_data" unless server_dh_inner[:server_nonce] == server_nonce
+
+      g_int           = server_dh_inner[:g]
+      dh_prime        = OpenSSL::BN.new(server_dh_inner[:dh_prime], 2)
+      g_a             = OpenSSL::BN.new(server_dh_inner[:g_a],      2)
+      @time_offset    = server_dh_inner[:server_time] - Time.now.to_i
+
+      # Pick a random 2048-bit b. Validating 1 < g_a < dh_prime - 1 is
+      # required by spec; we also keep the simpler check on g_b below.
+      one = OpenSSL::BN.new(1)
+      raise AuthError, "g_a out of range" if g_a <= one || g_a >= dh_prime - one
+      b_bn  = OpenSSL::BN.new(SecureRandom.bytes(256), 2)
+      g_bn  = OpenSSL::BN.new(g_int)
+      g_b   = g_bn.mod_exp(b_bn, dh_prime)
+      raise AuthError, "g_b out of range" if g_b <= one || g_b >= dh_prime - one
+
+      auth_key = pad_bn_to(g_a.mod_exp(b_bn, dh_prime), 256)
+
+      client_inner = @serializer.serialize_object(
+        _:            "client_DH_inner_data",
+        nonce:        nonce,
+        server_nonce: server_nonce,
+        retry_id:     0,
+        g_b:          g_b.to_s(2)
+      )
+      data_with_hash = Crypto.sha1(client_inner) + client_inner
+      pad_len = (16 - (data_with_hash.bytesize % 16)) % 16
+      data_with_hash += SecureRandom.bytes(pad_len) if pad_len.positive?
+      encrypted_data = Crypto.aes_ige_encrypt(tmp_key, tmp_iv, data_with_hash)
+
+      dh_gen = invoke_plain(
+        "set_client_DH_params",
+        nonce:          nonce,
+        server_nonce:   server_nonce,
+        encrypted_data: encrypted_data
+      )
+
+      verify_dh_gen(dh_gen, new_nonce, server_nonce, auth_key, expected: "dh_gen_ok")
+
+      @auth_key    = auth_key
+      @auth_key_id = Crypto.auth_key_id(auth_key)
+      @server_salt = compute_server_salt(new_nonce, server_nonce)
+      @logger.info { "DH handshake complete: auth_key_id=#{@auth_key_id.to_s(16)} dc=#{@dc_id}" }
+      nil
+    end
+
+    # DH key/iv derivation for the temporary AES used to encrypt the
+    # client/server DH inner messages. Public for testing.
+    def self.dh_kdf(new_nonce, server_nonce)
+      sha_ns = Crypto.sha1(new_nonce + server_nonce)
+      sha_sn = Crypto.sha1(server_nonce + new_nonce)
+      sha_nn = Crypto.sha1(new_nonce + new_nonce)
+      tmp_aes_key = sha_ns + sha_sn[0, 12]
+      tmp_aes_iv  = sha_sn[12, 8] + sha_nn + new_nonce[0, 4]
+      [tmp_aes_key, tmp_aes_iv]
+    end
+
+    # Compute the server salt: lower 8 bytes of XOR(new_nonce, server_nonce)
+    # read as a little-endian int64.
+    def self.compute_server_salt(new_nonce, server_nonce)
+      a = new_nonce[0, 8].unpack1("q<")
+      b = server_nonce[0, 8].unpack1("q<")
+      a ^ b
+    end
+
+    # Left-pad a positive OpenSSL::BN's big-endian byte representation to a
+    # fixed length with zero bytes. (auth_key must be exactly 256 bytes.)
+    def self.pad_bn_to(bn, size)
+      bytes = bn.to_s(2).b
+      raise AuthError, "BN larger than #{size} bytes (#{bytes.bytesize})" if bytes.bytesize > size
+      bytes.bytesize == size ? bytes : ("\x00".b * (size - bytes.bytesize)) + bytes
+    end
+
     # ------------------------------------------------------------------------
     # Lazy transport accessor
     # ------------------------------------------------------------------------
@@ -333,6 +461,30 @@ module TgClient
       else
         @msg_seqno_counter * 2
       end
+    end
+
+    # Instance-level shims for the helpers exposed as module methods on the
+    # class. (Module methods on the class keep the helpers easy to spec
+    # without instantiating the Client.)
+    def dh_kdf(new_nonce, server_nonce) = self.class.dh_kdf(new_nonce, server_nonce)
+    def compute_server_salt(new_nonce, server_nonce) = self.class.compute_server_salt(new_nonce, server_nonce)
+    def pad_bn_to(bn, size) = self.class.pad_bn_to(bn, size)
+
+    def verify_dh_gen(dh_gen, new_nonce, server_nonce, auth_key, expected:)
+      case dh_gen[:_]
+      when "dh_gen_ok"
+        return if expected == "dh_gen_ok" && new_nonce_hash(new_nonce, 1, auth_key) == dh_gen[:new_nonce_hash1]
+      when "dh_gen_retry"
+        raise AuthError, "DH handshake requires retry (new_nonce_hash2)"
+      when "dh_gen_fail"
+        raise AuthError, "DH handshake failed (new_nonce_hash3)"
+      end
+      raise AuthError, "DH handshake verification failed: #{dh_gen[:_]}"
+    end
+
+    def new_nonce_hash(new_nonce, marker, auth_key)
+      aux = Crypto.sha1(auth_key)[0, 8]
+      Crypto.sha1(new_nonce + [marker].pack("C") + aux)[-16, 16]
     end
   end
 end
