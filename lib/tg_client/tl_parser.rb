@@ -286,7 +286,8 @@ module TgClient
         when "int128" then read_bytes(io, 16)
         when "int256" then read_bytes(io, 32)
         when "double" then read_bytes(io, 8).unpack1("E")
-        when "string", "bytes" then read_string(io)
+        when "string" then read_string(io).force_encoding(Encoding::UTF_8)
+        when "bytes"  then read_string(io)
         when "Bool"   then read_bool(io)
         when "true"   then true
         when "#"      then read_bytes(io, 4).unpack1("L<")

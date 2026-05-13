@@ -102,9 +102,24 @@ RSpec.describe TgClient::TL do
     it "round-trips both forms" do
       ["", "x", "ab", "abc", "abcd", "a" * 253, "a" * 254, "a" * 1024].each do |s|
         bytes = serializer.serialize_value(s, "string")
-        expect(deserializer.read_value(StringIO.new(bytes), "string")).to eq(s.b)
+        expect(deserializer.read_value(StringIO.new(bytes), "string")).to eq(s)
         expect(bytes.bytesize % 4).to eq(0), "expected 4-byte aligned for size #{s.bytesize}"
       end
+    end
+
+    it "returns string-typed values in UTF-8 encoding" do
+      bytes = serializer.serialize_value("Café ñoño", "string")
+      result = deserializer.read_value(StringIO.new(bytes), "string")
+      expect(result.encoding).to eq(Encoding::UTF_8)
+      expect(result).to eq("Café ñoño")
+    end
+
+    it "returns bytes-typed values in binary (ASCII-8BIT) encoding" do
+      raw = SecureRandom.bytes(32)
+      bytes = serializer.serialize_value(raw, "bytes")
+      result = deserializer.read_value(StringIO.new(bytes), "bytes")
+      expect(result.encoding).to eq(Encoding::ASCII_8BIT)
+      expect(result).to eq(raw)
     end
   end
 

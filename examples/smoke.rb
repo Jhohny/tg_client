@@ -36,7 +36,7 @@ puts "auth: #{phase}"
 dialogs = client.get_dialogs(limit: 10)
 puts "dialogs: #{Array(dialogs[:dialogs]).size}"
 Array(dialogs[:chats]).first(3).each do |chat|
-  puts "  chat #{chat[:id]} (#{chat[:_]}) #{chat[:title]&.encode("UTF-8", invalid: :replace)}"
+  puts "  chat #{chat[:id]} (#{chat[:_]}) #{chat[:title]}"
 end
 
 chat_id = ENV["TG_CHAT"]
