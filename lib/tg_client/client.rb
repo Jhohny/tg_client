@@ -47,6 +47,44 @@ module TgClient
       @peer_cache          = { users: {}, channels: {} }
     end
 
+    # Authenticate with Telegram.
+    #
+    # If the session file already exists, the saved auth_key is loaded and
+    # the call returns :resumed without contacting the server beyond the TCP
+    # handshake. Otherwise the full DH handshake runs, an SMS/Telegram code
+    # is requested via auth.sendCode, the caller is prompted for the code
+    # (override via `code_provider:` for non-interactive use), and the result
+    # of auth.signIn is persisted.
+    #
+    # @param phone [String] international format, e.g. "+5215512345678"
+    # @param code_provider [Proc, nil] callable returning the verification
+    #   code as a String; defaults to a $stdin prompt
+    # @return [Symbol] :resumed if a session was loaded, :authenticated otherwise
+    # @raise [TgClient::PasswordRequired] if the account has 2FA enabled
+    def authenticate(phone:, code_provider: nil)
+      if (saved = Session.load(@session_file))
+        restore_session(saved)
+        transport # force connect
+        @logger.info { "resumed session for dc=#{@dc_id} auth_key_id=#{@auth_key_id.to_s(16)}" }
+        return :resumed
+      end
+
+      do_dh_handshake
+
+      sent_code = send_code_with_migrate(phone)
+      code = (code_provider || method(:default_code_prompt)).call
+
+      auth = invoke(
+        "auth.signIn",
+        phone_number:    phone,
+        phone_code_hash: sent_code[:phone_code_hash],
+        phone_code:      code
+      )
+      user_id = auth.is_a?(Hash) ? auth.dig(:user, :id) : nil
+      save_session(user_id: user_id)
+      :authenticated
+    end
+
     # Send an encrypted RPC call and wait for its rpc_result. Returns the
     # decoded result body (a hash with :_). Handles bad_server_salt retries,
     # rpc_error -> RPCError/MigrateError/PasswordRequired, and unwraps
@@ -371,22 +409,9 @@ module TgClient
     # ------------------------------------------------------------------------
 
     def wrap_first_call(inner_body_bytes)
-      # initConnection wraps a query in our device/lang metadata.
-      init_conn = @serializer.serialize_method(
-        "initConnection",
-        api_id:           @api_id,
-        device_model:     "Ruby",
-        system_version:   RUBY_VERSION,
-        app_version:      TgClient::VERSION,
-        system_lang_code: "en",
-        lang_pack:        "",
-        lang_code:        "en",
-        query:            nil # filled in below as raw bytes
-      )
-
       # initConnection's last param is `query:!X` — a generic Object. Our
-      # serializer would normally emit an Object via its hash form; but we
-      # already have the serialized bytes. The trick: rebuild manually.
+      # serializer can't pass raw bytes through that field, so we write the
+      # combinator manually below.
       init_conn_bytes = build_init_connection(inner_body_bytes)
 
       # invokeWithLayer { layer:int query:!X }
@@ -485,6 +510,55 @@ module TgClient
     def new_nonce_hash(new_nonce, marker, auth_key)
       aux = Crypto.sha1(auth_key)[0, 8]
       Crypto.sha1(new_nonce + [marker].pack("C") + aux)[-16, 16]
+    end
+
+    # ------------------------------------------------------------------------
+    # Session lifecycle (used by #authenticate)
+    # ------------------------------------------------------------------------
+
+    def restore_session(session)
+      @auth_key    = session[:auth_key]
+      @auth_key_id = session[:auth_key_id]
+      @server_salt = session[:server_salt].unpack1("q<")
+      @dc_id       = session[:dc_id]
+    end
+
+    def save_session(user_id: nil)
+      Session.save(@session_file, {
+        dc_id:       @dc_id,
+        auth_key:    @auth_key,
+        auth_key_id: @auth_key_id,
+        server_salt: [@server_salt].pack("q<"),
+        user_id:     user_id,
+        layer:       TgClient::SCHEMA_LAYER
+      })
+    end
+
+    # Calls auth.sendCode; on PHONE_MIGRATE_X reconnects to the indicated DC
+    # and re-runs the DH handshake before retrying. Returns the auth.sentCode
+    # response on success.
+    def send_code_with_migrate(phone)
+      loop do
+        return invoke(
+          "auth.sendCode",
+          phone_number: phone,
+          api_id:       @api_id,
+          api_hash:     @api_hash,
+          settings:     { _: "codeSettings" }
+        )
+      rescue MigrateError => e
+        @logger.info { "PHONE_MIGRATE → DC#{e.dc_id}; reconnecting and re-handshaking" }
+        transport.reconnect_to(e.dc_id)
+        @dc_id       = e.dc_id
+        @initialized = false
+        do_dh_handshake
+      end
+    end
+
+    def default_code_prompt
+      print "Enter the Telegram login code: "
+      $stdout.flush
+      $stdin.gets.to_s.strip
     end
   end
 end
