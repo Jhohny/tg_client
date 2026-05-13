@@ -66,3 +66,4 @@ module TgClient
 end
 
 require_relative "tg_client/tl_parser"
+require_relative "tg_client/crypto"
