@@ -419,8 +419,8 @@ module TgClient
 
     def unwrap_gzip(body)
       return body unless body.is_a?(Hash) && body[:_] == "gzip_packed"
-      raw = Zlib::Inflate.inflate(body[:packed_data])
-      @deserializer.deserialize(raw)
+      raw = Zlib::GzipReader.new(StringIO.new(body[:packed_data].b)).read
+      @deserializer.deserialize(raw.b)
     end
 
     def unwrap_rpc_result(result)

@@ -204,6 +204,28 @@ RSpec.describe TgClient::Client do
     end
   end
 
+  describe "#invoke and gzip_packed results" do
+    it "transparently inflates gzip_packed rpc_result payloads" do
+      transport.on_send do |sent_frame|
+        my_id = ServerHelper.extract_msg_id_from_client_frame(sent_frame, auth_key)
+
+        # Inner: a boolTrue. Compress it with gzip format.
+        inner_bytes = [TgClient::TL::BOOL_TRUE_ID].pack("L<")
+        gz_buf = StringIO.new("".b)
+        gz_buf.set_encoding(Encoding::BINARY)
+        Zlib::GzipWriter.wrap(gz_buf) { |gz| gz.write(inner_bytes) }
+        compressed = gz_buf.string
+
+        gzip_obj = encode_object(_: "gzip_packed", packed_data: compressed)
+        body = [client.registry.by_name("rpc_result").id, my_id].pack("L<q<") + gzip_obj
+        transport.queue_recv(ServerHelper.encrypted_frame(
+                               auth_key: auth_key, body_bytes: body, session_id: session_id))
+      end
+
+      expect(client.invoke("help.getConfig")).to eq(true)
+    end
+  end
+
   describe "#invoke_plain (unencrypted)" do
     it "wraps the body with auth_key_id=0 and reads an unencrypted response" do
       # Construct an unencrypted response: [auth_key_id=0][msg_id][msg_len][body]
