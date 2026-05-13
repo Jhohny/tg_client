@@ -68,3 +68,4 @@ end
 require_relative "tg_client/tl_parser"
 require_relative "tg_client/crypto"
 require_relative "tg_client/transport"
+require_relative "tg_client/session"
