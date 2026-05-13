@@ -85,6 +85,37 @@ module TgClient
       :authenticated
     end
 
+    # Fetch chat history as an array of plain Ruby hashes.
+    #
+    # @param chat_id [Integer] Telegram chat id. Positive → user id, negative
+    #   value greater than -1_000_000_000_000 → basic group (abs value is
+    #   chat_id), value ≤ -1_000_000_000_000 → channel/supergroup
+    #   (`-100<channel_id>` convention used by bots).
+    # @param date_from [Date, Time, Integer] only messages older than this
+    #   anchor are returned (`offset_date` per the Telegram API). Date is
+    #   converted to a unix timestamp; Integer is passed through.
+    # @param limit [Integer] max messages to return (1..100 per API).
+    # @return [Array<Hash>] each hash has: :id, :date (Time), :from_id,
+    #   :from_name, :text.
+    # @raise [TgClient::Error] if the peer needs an access_hash but the cache
+    #   is empty — call #get_dialogs first to populate it.
+    def get_history(chat_id:, date_from:, limit: 100)
+      peer = build_input_peer(chat_id)
+      response = invoke(
+        "messages.getHistory",
+        peer:        peer,
+        offset_id:   0,
+        offset_date: normalize_date(date_from),
+        add_offset:  0,
+        limit:       limit,
+        max_id:      0,
+        min_id:      0,
+        hash:        0
+      )
+      update_peer_cache_from(response)
+      flatten_history(response)
+    end
+
     # Fetch the user's dialog list and refresh the local access_hash cache.
     #
     # Returns the raw `messages.dialogs` / `messages.dialogsSlice` response
@@ -594,6 +625,81 @@ module TgClient
       Array(result[:chats]).each do |c|
         @peer_cache[:channels][c[:id]] = c[:access_hash] if c[:access_hash]
       end
+    end
+
+    # ------------------------------------------------------------------------
+    # Peer resolution and history shaping (used by get_history)
+    # ------------------------------------------------------------------------
+
+    CHANNEL_ID_OFFSET = 1_000_000_000_000
+    private_constant :CHANNEL_ID_OFFSET
+
+    def build_input_peer(chat_id)
+      if chat_id.positive?
+        access_hash = @peer_cache[:users][chat_id] or
+          raise Error, "no cached access_hash for user #{chat_id} — call #get_dialogs first"
+        { _: "inputPeerUser", user_id: chat_id, access_hash: access_hash }
+      elsif chat_id > -CHANNEL_ID_OFFSET
+        { _: "inputPeerChat", chat_id: -chat_id }
+      else
+        channel_id = -chat_id - CHANNEL_ID_OFFSET
+        access_hash = @peer_cache[:channels][channel_id] or
+          raise Error, "no cached access_hash for channel #{channel_id} — call #get_dialogs first"
+        { _: "inputPeerChannel", channel_id: channel_id, access_hash: access_hash }
+      end
+    end
+
+    def normalize_date(date)
+      case date
+      when Integer then date
+      when Time    then date.to_i
+      when Date    then date.to_time.to_i
+      else
+        raise ArgumentError, "date_from must be Integer/Time/Date, got #{date.class}"
+      end
+    end
+
+    def flatten_history(response)
+      return [] unless response.is_a?(Hash) && response[:messages]
+
+      users = Array(response[:users]).each_with_object({}) { |u, h| h[u[:id]] = u }
+      chats = Array(response[:chats]).each_with_object({}) { |c, h| h[c[:id]] = c }
+
+      response[:messages].filter_map do |msg|
+        next unless msg[:_] == "message"
+        from = resolve_from(msg[:from_id] || msg[:peer_id], users, chats)
+        {
+          id:        msg[:id],
+          date:      msg[:date] ? Time.at(msg[:date]) : nil,
+          from_id:   from[:id],
+          from_name: from[:name],
+          text:      msg[:message].to_s
+        }
+      end
+    end
+
+    def resolve_from(peer, users, chats)
+      return { id: nil, name: nil } unless peer.is_a?(Hash)
+
+      case peer[:_]
+      when "peerUser"
+        u = users[peer[:user_id]]
+        { id: peer[:user_id], name: user_display_name(u) }
+      when "peerChat"
+        c = chats[peer[:chat_id]]
+        { id: peer[:chat_id], name: c&.dig(:title) }
+      when "peerChannel"
+        c = chats[peer[:channel_id]]
+        { id: peer[:channel_id], name: c&.dig(:title) }
+      else
+        { id: nil, name: nil }
+      end
+    end
+
+    def user_display_name(user)
+      return nil unless user.is_a?(Hash)
+      name = [user[:first_name], user[:last_name]].compact.join(" ").strip
+      name.empty? ? user[:username] : name
     end
   end
 end
