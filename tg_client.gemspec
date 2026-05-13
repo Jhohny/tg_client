@@ -23,6 +23,9 @@ Gem::Specification.new do |spec|
   ]
   spec.require_paths = ["lib"]
 
+  # logger was removed from default gems in Ruby 4.0; we need it on $LOAD_PATH.
+  spec.add_dependency "logger", "~> 1.6"
+
   spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rspec", "~> 3.13"
 end

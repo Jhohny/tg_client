@@ -6,7 +6,6 @@ require "socket"
 require "stringio"
 require "zlib"
 require "json"
-require "base64"
 require "logger"
 require "date"
 require "time"
@@ -65,3 +64,5 @@ module TgClient
   # Raised when the dispatcher exhausts its bad_server_salt retry budget.
   class BadServerSaltError < Error; end
 end
+
+require_relative "tg_client/tl_parser"
