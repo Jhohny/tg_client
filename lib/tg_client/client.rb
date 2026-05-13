@@ -85,6 +85,27 @@ module TgClient
       :authenticated
     end
 
+    # Fetch the user's dialog list and refresh the local access_hash cache.
+    #
+    # Returns the raw `messages.dialogs` / `messages.dialogsSlice` response
+    # (a hash with :dialogs, :messages, :chats, :users). Side effect: every
+    # user and channel that has an access_hash gets cached so subsequent
+    # #get_history calls can resolve their InputPeer.
+    #
+    # @param limit [Integer] max dialogs to fetch (default 100)
+    def get_dialogs(limit: 100)
+      result = invoke(
+        "messages.getDialogs",
+        offset_date: 0,
+        offset_id:   0,
+        offset_peer: { _: "inputPeerEmpty" },
+        limit:       limit,
+        hash:        0
+      )
+      update_peer_cache_from(result)
+      result
+    end
+
     # Send an encrypted RPC call and wait for its rpc_result. Returns the
     # decoded result body (a hash with :_). Handles bad_server_salt retries,
     # rpc_error -> RPCError/MigrateError/PasswordRequired, and unwraps
@@ -559,6 +580,20 @@ module TgClient
       print "Enter the Telegram login code: "
       $stdout.flush
       $stdin.gets.to_s.strip
+    end
+
+    # ------------------------------------------------------------------------
+    # Peer cache (used by get_history to resolve access_hash)
+    # ------------------------------------------------------------------------
+
+    def update_peer_cache_from(result)
+      return unless result.is_a?(Hash)
+      Array(result[:users]).each do |u|
+        @peer_cache[:users][u[:id]] = u[:access_hash] if u[:access_hash]
+      end
+      Array(result[:chats]).each do |c|
+        @peer_cache[:channels][c[:id]] = c[:access_hash] if c[:access_hash]
+      end
     end
   end
 end
