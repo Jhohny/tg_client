@@ -10,14 +10,23 @@ Gem::Specification.new do |spec|
 
   spec.summary     = "Minimal Telegram MTProto 2.0 client for reading chat history"
   spec.description = "Pure Ruby MTProto 2.0 client focused on a small public API: authenticate(phone:) and get_history(chat_id:, date_from:, limit:). Persists session to a local file."
-  spec.homepage    = "https://github.com/jhonathan/tg_client"
+  spec.homepage    = "https://github.com/Jhohny/tg_client"
   spec.license     = "MIT"
 
   spec.required_ruby_version = ">= 3.2"
 
+  spec.metadata = {
+    "homepage_uri"          => spec.homepage,
+    "source_code_uri"       => spec.homepage,
+    "bug_tracker_uri"       => "#{spec.homepage}/issues",
+    "changelog_uri"         => "#{spec.homepage}/blob/main/CHANGELOG.md",
+    "rubygems_mfa_required" => "true"
+  }
+
   spec.files = Dir[
     "lib/**/*.rb",
     "lib/tg_client/schema/*",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE*"
   ]
